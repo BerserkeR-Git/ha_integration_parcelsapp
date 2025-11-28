@@ -17,6 +17,7 @@ from .const import DOMAIN, DEFAULT_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
+
 class ParcelsAppCoordinator(DataUpdateCoordinator):
     """Custom coordinator for Parcels App."""
 
@@ -34,8 +35,35 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         self.tracked_packages = {}
         self.store = Store(hass, 1, f"{DOMAIN}_{entry.entry_id}_tracked_packages")
         # Get the first two letters of the language code
-        language_code = (hass.config.language or 'en')[:2].lower()
+        language_code = (hass.config.language or "en")[:2].lower()
         self.language = language_code
+
+    def _get_eta_ranges(self, shipment: dict):
+        """Extract ETA day-range and date-range from shipment data."""
+        eta = shipment.get("eta") or {}
+        eta_period = eta.get("period") or []
+        eta_remaining = eta.get("remaining") or []
+
+        eta_days_range = None
+        if (
+            len(eta_remaining) >= 2
+            and eta_remaining[0] is not None
+            and eta_remaining[1] is not None
+        ):
+            # single clean attribute, e.g. "9-15"
+            eta_days_range = f"{eta_remaining[0]}-{eta_remaining[1]}"
+
+        eta_date_range = None
+        if (
+            len(eta_period) >= 2
+            and eta_period[0] is not None
+            and eta_period[1] is not None
+        ):
+            # single clean attribute containing two ISO datetimes
+            # e.g. "2025-12-07T00:00:00+00:00/2025-12-13T00:00:00+00:00"
+            eta_date_range = f"{eta_period[0]}/{eta_period[1]}"
+
+        return eta_days_range, eta_date_range
 
     async def async_init(self):
         """Initialize the coordinator."""
@@ -47,8 +75,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         if stored_data:
             # Convert uuid_timestamp back to datetime if it's stored as string
             for package in stored_data.values():
-                if 'uuid_timestamp' in package and isinstance(package['uuid_timestamp'], str):
-                    package['uuid_timestamp'] = datetime.fromisoformat(package['uuid_timestamp'])
+                if (
+                    "uuid_timestamp" in package
+                    and isinstance(package["uuid_timestamp"], str)
+                ):
+                    package["uuid_timestamp"] = datetime.fromisoformat(
+                        package["uuid_timestamp"]
+                    )
             self.tracked_packages = stored_data
         else:
             self.tracked_packages = {}
@@ -57,8 +90,11 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         """Save tracked packages to persistent storage."""
         # Convert uuid_timestamp to ISO format string before saving
         for package in self.tracked_packages.values():
-            if 'uuid_timestamp' in package and isinstance(package['uuid_timestamp'], datetime):
-                package['uuid_timestamp'] = package['uuid_timestamp'].isoformat()
+            if (
+                "uuid_timestamp" in package
+                and isinstance(package["uuid_timestamp"], datetime)
+            ):
+                package["uuid_timestamp"] = package["uuid_timestamp"].isoformat()
         await self.store.async_save(self.tracked_packages)
         await self.async_request_refresh()
 
@@ -103,6 +139,8 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 elif "shipments" in data and data["shipments"]:
                     # Shipment data is returned directly
                     shipment = data["shipments"][0]
+                    eta_days_range, eta_date_range = self._get_eta_ranges(shipment)
+
                     package_data = {
                         **existing_package_data,
                         "status": shipment.get("status", "unknown"),
@@ -111,9 +149,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "message": shipment.get("lastState", {}).get(
                             "status", "No status available"
                         ),
-                        "location": shipment.get("lastState", {}).get("location", "undefined"),
+                        "location": shipment.get("lastState", {}).get(
+                            "location", "undefined"
+                        ),
                         "origin": shipment.get("origin"),
                         "destination": shipment.get("destination"),
+                        "eta_days_range": eta_days_range,
+                        "eta_date_range": eta_date_range,
                         "carrier": shipment.get("detectedCarrier", {}).get("name"),
                         "days_in_transit": next(
                             (
@@ -146,9 +188,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             del self.tracked_packages[tracking_id]
             await self._save_tracked_packages()
         else:
-            _LOGGER.warning(f"Tracking ID {tracking_id} not found in tracked packages.")
+            _LOGGER.warning(
+                f"Tracking ID {tracking_id} not found in tracked packages."
+            )
 
-    async def update_package(self, tracking_id: str, uuid: str | None, uuid_timestamp: datetime | None) -> None:
+    async def update_package(
+        self, tracking_id: str, uuid: str | None, uuid_timestamp: datetime | None
+    ) -> None:
         """Update a single package."""
         # Ensure uuid_timestamp is a datetime object
         if isinstance(uuid_timestamp, str):
@@ -166,9 +212,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
 
         if uuid_expired or not uuid:
             # Get a new UUID or shipment data without overwriting existing data
-            new_uuid, new_uuid_timestamp, shipment_data = await self.get_new_uuid(tracking_id)
+            new_uuid, new_uuid_timestamp, shipment_data = await self.get_new_uuid(
+                tracking_id
+            )
             if shipment_data:
                 # Update package data with shipment data
+                eta_days_range, eta_date_range = self._get_eta_ranges(shipment_data)
+
                 existing_package_data = self.tracked_packages.get(tracking_id, {})
                 package_data = {
                     **existing_package_data,
@@ -176,9 +226,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                     "message": shipment_data.get("lastState", {}).get(
                         "status", "No status available"
                     ),
-                    "location": shipment_data.get("lastState", {}).get("location", "undefined"),
+                    "location": shipment_data.get("lastState", {}).get(
+                        "location", "undefined"
+                    ),
                     "origin": shipment_data.get("origin"),
                     "destination": shipment_data.get("destination"),
+                    "eta_days_range": eta_days_range,
+                    "eta_date_range": eta_date_range,
                     "carrier": shipment_data.get("detectedCarrier", {}).get("name"),
                     "days_in_transit": next(
                         (
@@ -196,14 +250,16 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             elif new_uuid:
                 # Update uuid and uuid_timestamp
                 package_data = self.tracked_packages.get(tracking_id, {})
-                package_data['uuid'] = new_uuid
-                package_data['uuid_timestamp'] = new_uuid_timestamp
+                package_data["uuid"] = new_uuid
+                package_data["uuid_timestamp"] = new_uuid_timestamp
                 self.tracked_packages[tracking_id] = package_data
                 await self._save_tracked_packages()
                 uuid = new_uuid
                 uuid_timestamp = new_uuid_timestamp
             else:
-                _LOGGER.error(f"Failed to get new UUID or shipment data for {tracking_id}")
+                _LOGGER.error(
+                    f"Failed to get new UUID or shipment data for {tracking_id}"
+                )
                 return
 
         # Continue with updating package data using the UUID
@@ -303,6 +359,8 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
 
                 if data.get("done") and data.get("shipments"):
                     shipment = data["shipments"][0]
+                    eta_days_range, eta_date_range = self._get_eta_ranges(shipment)
+
                     existing_package_data = self.tracked_packages.get(tracking_id, {})
                     package_data = {
                         **existing_package_data,
@@ -310,9 +368,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "message": shipment.get("lastState", {}).get(
                             "status", "No status available"
                         ),
-                        "location": shipment.get("lastState", {}).get("location", "undefined"),
+                        "location": shipment.get("lastState", {}).get(
+                            "location", "undefined"
+                        ),
                         "origin": shipment.get("origin"),
                         "destination": shipment.get("destination"),
+                        "eta_days_range": eta_days_range,
+                        "eta_date_range": eta_date_range,
                         "carrier": shipment.get("detectedCarrier", {}).get("name"),
                         "days_in_transit": next(
                             (
