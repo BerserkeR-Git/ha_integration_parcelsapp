@@ -32,10 +32,14 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         self.api_key = entry.data["api_key"]
         self.destination_country = entry.data["destination_country"]
         self.session = aiohttp.ClientSession()
-        self.tracked_packages = {}
+        self.tracked_packages: dict[str, dict] = {}
         self.store = Store(hass, 1, f"{DOMAIN}_{entry.entry_id}_tracked_packages")
+
+        # Use the first two letters of HA language as API language
         language_code = (hass.config.language or "en")[:2].lower()
         self.language = language_code
+
+    # ---------- helpers for shipment data ----------
 
     def _get_eta_ranges(self, shipment: dict):
         """Extract ETA day-range and date-range from shipment data."""
@@ -52,11 +56,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             eta_days_range = f"{eta_remaining[0]}-{eta_remaining[1]}"
 
         eta_date_range = None
-        if (
-            len(eta_period) >= 2
-            and eta_period[0] is not None
-            and eta_period[1] is not None
-        ):
+        if len(eta_period) >= 2 and eta_period[0] and eta_period[1]:
             eta_date_range = f"{eta_period[0]}/{eta_period[1]}"
 
         return eta_days_range, eta_date_range
@@ -67,6 +67,29 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             if attr.get("l") == "eta":
                 return attr.get("val")
         return None
+
+    def _get_location(self, shipment: dict) -> str:
+        """Get the best current location for the shipment.
+
+        Priority:
+        1. lastState.location, if present
+        2. last state in states[] that has a location field
+        3. 'undefined' if nothing is available
+        """
+        last_state = shipment.get("lastState") or {}
+        loc = last_state.get("location")
+        if loc:
+            return loc
+
+        # Fallback: iterate states in reverse to find last location
+        for state in reversed(shipment.get("states", [])):
+            loc2 = state.get("location")
+            if loc2:
+                return loc2
+
+        return "undefined"
+
+    # ---------- persistence ----------
 
     async def async_init(self):
         """Initialize the coordinator."""
@@ -99,7 +122,9 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         await self.store.async_save(self.tracked_packages)
         await self.async_request_refresh()
 
-    async def track_package(self, tracking_id: str, name: str = None) -> None:
+    # ---------- API operations ----------
+
+    async def track_package(self, tracking_id: str, name: str | None = None) -> None:
         """Track a new package or update an existing one."""
         url = "https://parcelsapp.com/api/v3/shipments/tracking"
         payload = json.dumps(
@@ -125,7 +150,9 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 data = json.loads(response_text)
 
                 existing_package_data = self.tracked_packages.get(tracking_id, {})
+
                 if "uuid" in data:
+                    # New tracking request – shipment not yet resolved
                     package_data = {
                         **existing_package_data,
                         "status": "pending",
@@ -136,10 +163,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "name": name or existing_package_data.get("name"),
                     }
                     self.tracked_packages[tracking_id] = package_data
+
                 elif "shipments" in data and data["shipments"]:
+                    # Shipment data returned directly
                     shipment = data["shipments"][0]
                     eta_days_range, eta_date_range = self._get_eta_ranges(shipment)
                     expected_delivery = self._get_expected_delivery(shipment)
+                    location = self._get_location(shipment)
 
                     package_data = {
                         **existing_package_data,
@@ -149,9 +179,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "message": shipment.get("lastState", {}).get(
                             "status", "No status available"
                         ),
-                        "location": shipment.get("lastState", {}).get(
-                            "location", "undefined"
-                        ),
+                        "location": location,
                         "origin": shipment.get("origin"),
                         "destination": shipment.get("destination"),
                         "eta_days_range": eta_days_range,
@@ -170,17 +198,24 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "name": name or existing_package_data.get("name"),
                     }
                     self.tracked_packages[tracking_id] = package_data
+
                 else:
                     _LOGGER.error(
-                        f"Unexpected API response for tracking ID {tracking_id}. Response: {response_text}"
+                        "Unexpected API response for tracking ID %s. Response: %s",
+                        tracking_id,
+                        response_text,
                     )
                     return
+
             await self._save_tracked_packages()
+
         except aiohttp.ClientError as err:
-            _LOGGER.error(f"Error tracking package {tracking_id}: {err}")
+            _LOGGER.error("Error tracking package %s: %s", tracking_id, err)
         except json.JSONDecodeError:
             _LOGGER.error(
-                f"Failed to parse API response for tracking ID {tracking_id}. Response: {response_text}"
+                "Failed to parse API response for tracking ID %s. Response: %s",
+                tracking_id,
+                response_text,
             )
 
     async def remove_package(self, tracking_id: str) -> None:
@@ -190,7 +225,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             await self._save_tracked_packages()
         else:
             _LOGGER.warning(
-                f"Tracking ID {tracking_id} not found in tracked packages."
+                "Tracking ID %s not found in tracked packages.", tracking_id
             )
 
     async def update_package(
@@ -205,7 +240,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             time_since_uuid = datetime.now() - uuid_timestamp
             if time_since_uuid > timedelta(minutes=30):
                 uuid_expired = True
-                _LOGGER.debug(f"UUID for {tracking_id} is expired.")
+                _LOGGER.debug("UUID for %s is expired.", tracking_id)
         else:
             uuid_expired = True
 
@@ -216,6 +251,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             if shipment_data:
                 eta_days_range, eta_date_range = self._get_eta_ranges(shipment_data)
                 expected_delivery = self._get_expected_delivery(shipment_data)
+                location = self._get_location(shipment_data)
 
                 existing_package_data = self.tracked_packages.get(tracking_id, {})
                 package_data = {
@@ -224,9 +260,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                     "message": shipment_data.get("lastState", {}).get(
                         "status", "No status available"
                     ),
-                    "location": shipment_data.get("lastState", {}).get(
-                        "location", "undefined"
-                    ),
+                    "location": location,
                     "origin": shipment_data.get("origin"),
                     "destination": shipment_data.get("destination"),
                     "eta_days_range": eta_days_range,
@@ -256,7 +290,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 uuid_timestamp = new_uuid_timestamp
             else:
                 _LOGGER.error(
-                    f"Failed to get new UUID or shipment data for {tracking_id}"
+                    "Failed to get new UUID or shipment data for %s", tracking_id
                 )
                 return
 
@@ -297,10 +331,10 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "response_code": response.status,
                     }
         except aiohttp.ClientError as err:
-            raise UpdateFailed(f"Error communicating with API: {err}")
+            raise UpdateFailed(f"Error communicating with API: {err}") from err
 
     async def get_new_uuid(self, tracking_id: str):
-        """Get a new UUID for a tracking ID or update package data if shipment info is returned."""
+        """Get a new UUID for a tracking ID or return shipment data if already available."""
         url = "https://parcelsapp.com/api/v3/shipments/tracking"
         payload = json.dumps(
             {
@@ -331,16 +365,21 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                     return None, None, shipment
                 else:
                     _LOGGER.error(
-                        f"Unexpected API response when getting new UUID for tracking ID {tracking_id}. Response: {response_text}"
+                        "Unexpected API response when getting new UUID for %s. Response: %s",
+                        tracking_id,
+                        response_text,
                     )
                     return None, None, None
         except aiohttp.ClientError as err:
-            _LOGGER.error(f"Error getting new UUID for {tracking_id}: {err}")
+            _LOGGER.error("Error getting new UUID for %s: %s", tracking_id, err)
             return None, None, None
 
     async def _fetch_shipment_data(self, tracking_id: str, uuid: str) -> None:
         """Fetch shipment data using UUID and update package data."""
-        url = f"https://parcelsapp.com/api/v3/shipments/tracking?uuid={uuid}&apiKey={self.api_key}&language={self.language}"
+        url = (
+            f"https://parcelsapp.com/api/v3/shipments/tracking?"
+            f"uuid={uuid}&apiKey={self.api_key}&language={self.language}"
+        )
 
         try:
             async with self.session.get(url) as response:
@@ -351,6 +390,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                     shipment = data["shipments"][0]
                     eta_days_range, eta_date_range = self._get_eta_ranges(shipment)
                     expected_delivery = self._get_expected_delivery(shipment)
+                    location = self._get_location(shipment)
 
                     existing_package_data = self.tracked_packages.get(tracking_id, {})
                     package_data = {
@@ -359,9 +399,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "message": shipment.get("lastState", {}).get(
                             "status", "No status available"
                         ),
-                        "location": shipment.get("lastState", {}).get(
-                            "location", "undefined"
-                        ),
+                        "location": location,
                         "origin": shipment.get("origin"),
                         "destination": shipment.get("destination"),
                         "eta_days_range": eta_days_range,
@@ -381,6 +419,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                     self.tracked_packages[tracking_id] = package_data
                     await self._save_tracked_packages()
                 else:
-                    _LOGGER.debug(f"Tracking data not yet available for {tracking_id}")
+                    _LOGGER.debug("Tracking data not yet available for %s", tracking_id)
         except aiohttp.ClientError as err:
-            _LOGGER.error(f"Error updating package {tracking_id}: {err}")
+            _LOGGER.error("Error updating package %s: %s", tracking_id, err)
