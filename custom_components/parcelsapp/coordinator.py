@@ -34,7 +34,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         self.session = aiohttp.ClientSession()
         self.tracked_packages = {}
         self.store = Store(hass, 1, f"{DOMAIN}_{entry.entry_id}_tracked_packages")
-        # Get the first two letters of the language code
         language_code = (hass.config.language or "en")[:2].lower()
         self.language = language_code
 
@@ -50,7 +49,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             and eta_remaining[0] is not None
             and eta_remaining[1] is not None
         ):
-            # single clean attribute, e.g. "9-15"
             eta_days_range = f"{eta_remaining[0]}-{eta_remaining[1]}"
 
         eta_date_range = None
@@ -59,11 +57,16 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             and eta_period[0] is not None
             and eta_period[1] is not None
         ):
-            # single clean attribute containing two ISO datetimes
-            # e.g. "2025-12-07T00:00:00+00:00/2025-12-13T00:00:00+00:00"
             eta_date_range = f"{eta_period[0]}/{eta_period[1]}"
 
         return eta_days_range, eta_date_range
+
+    def _get_expected_delivery(self, shipment: dict):
+        """Extract expected delivery window string from attributes, if present."""
+        for attr in shipment.get("attributes", []):
+            if attr.get("l") == "eta":
+                return attr.get("val")
+        return None
 
     async def async_init(self):
         """Initialize the coordinator."""
@@ -73,7 +76,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         """Load tracked packages from persistent storage."""
         stored_data = await self.store.async_load()
         if stored_data:
-            # Convert uuid_timestamp back to datetime if it's stored as string
             for package in stored_data.values():
                 if (
                     "uuid_timestamp" in package
@@ -88,7 +90,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
 
     async def _save_tracked_packages(self):
         """Save tracked packages to persistent storage."""
-        # Convert uuid_timestamp to ISO format string before saving
         for package in self.tracked_packages.values():
             if (
                 "uuid_timestamp" in package
@@ -125,7 +126,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
 
                 existing_package_data = self.tracked_packages.get(tracking_id, {})
                 if "uuid" in data:
-                    # New tracking request
                     package_data = {
                         **existing_package_data,
                         "status": "pending",
@@ -137,9 +137,9 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                     }
                     self.tracked_packages[tracking_id] = package_data
                 elif "shipments" in data and data["shipments"]:
-                    # Shipment data is returned directly
                     shipment = data["shipments"][0]
                     eta_days_range, eta_date_range = self._get_eta_ranges(shipment)
+                    expected_delivery = self._get_expected_delivery(shipment)
 
                     package_data = {
                         **existing_package_data,
@@ -156,12 +156,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "destination": shipment.get("destination"),
                         "eta_days_range": eta_days_range,
                         "eta_date_range": eta_date_range,
+                        "expected_delivery": expected_delivery,
                         "carrier": shipment.get("detectedCarrier", {}).get("name"),
                         "days_in_transit": next(
                             (
-                                attr["val"]
+                                attr.get("val")
                                 for attr in shipment.get("attributes", [])
-                                if attr["l"] == "days_transit"
+                                if attr.get("l") == "days_transit"
                             ),
                             None,
                         ),
@@ -196,11 +197,9 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         self, tracking_id: str, uuid: str | None, uuid_timestamp: datetime | None
     ) -> None:
         """Update a single package."""
-        # Ensure uuid_timestamp is a datetime object
         if isinstance(uuid_timestamp, str):
             uuid_timestamp = datetime.fromisoformat(uuid_timestamp)
 
-        # Check if UUID is expired
         uuid_expired = False
         if uuid_timestamp:
             time_since_uuid = datetime.now() - uuid_timestamp
@@ -208,16 +207,15 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 uuid_expired = True
                 _LOGGER.debug(f"UUID for {tracking_id} is expired.")
         else:
-            uuid_expired = True  # No UUID timestamp means we need a new UUID
+            uuid_expired = True
 
         if uuid_expired or not uuid:
-            # Get a new UUID or shipment data without overwriting existing data
             new_uuid, new_uuid_timestamp, shipment_data = await self.get_new_uuid(
                 tracking_id
             )
             if shipment_data:
-                # Update package data with shipment data
                 eta_days_range, eta_date_range = self._get_eta_ranges(shipment_data)
+                expected_delivery = self._get_expected_delivery(shipment_data)
 
                 existing_package_data = self.tracked_packages.get(tracking_id, {})
                 package_data = {
@@ -233,12 +231,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                     "destination": shipment_data.get("destination"),
                     "eta_days_range": eta_days_range,
                     "eta_date_range": eta_date_range,
+                    "expected_delivery": expected_delivery,
                     "carrier": shipment_data.get("detectedCarrier", {}).get("name"),
                     "days_in_transit": next(
                         (
-                            attr["val"]
+                            attr.get("val")
                             for attr in shipment_data.get("attributes", [])
-                            if attr["l"] == "days_transit"
+                            if attr.get("l") == "days_transit"
                         ),
                         None,
                     ),
@@ -246,9 +245,8 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 }
                 self.tracked_packages[tracking_id] = package_data
                 await self._save_tracked_packages()
-                return  # Shipment data updated, no need to proceed further
+                return
             elif new_uuid:
-                # Update uuid and uuid_timestamp
                 package_data = self.tracked_packages.get(tracking_id, {})
                 package_data["uuid"] = new_uuid
                 package_data["uuid_timestamp"] = new_uuid_timestamp
@@ -262,8 +260,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 )
                 return
 
-        # Continue with updating package data using the UUID
-        # Fetch shipment data using the UUID
         await self._fetch_shipment_data(tracking_id, uuid)
 
     async def update_tracked_packages(self) -> None:
@@ -278,13 +274,8 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Fetch data from API endpoint and update tracked packages."""
-        # First, update the Parcels App status
         status_data = await self._fetch_parcels_app_status()
-
-        # Then, update all tracked packages
         await self.update_tracked_packages()
-
-        # Combine the status data with tracked packages data
         return {
             "parcels_app_status": status_data,
             "tracked_packages": self.tracked_packages,
@@ -296,7 +287,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
             start_time = time.time()
             async with async_timeout.timeout(10):
                 async with self.session.get("https://parcelsapp.com/") as response:
-                    await response.text()  # Ensure the response is fully received
+                    await response.text()
                     response.raise_for_status()
                     end_time = time.time()
                     response_time = end_time - start_time
@@ -334,11 +325,10 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 data = json.loads(response_text)
 
                 if "uuid" in data:
-                    return data["uuid"], datetime.now(), None  # No shipment data
+                    return data["uuid"], datetime.now(), None
                 elif "shipments" in data and data["shipments"]:
-                    # Shipment data is returned directly
                     shipment = data["shipments"][0]
-                    return None, None, shipment  # Return shipment data
+                    return None, None, shipment
                 else:
                     _LOGGER.error(
                         f"Unexpected API response when getting new UUID for tracking ID {tracking_id}. Response: {response_text}"
@@ -360,6 +350,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 if data.get("done") and data.get("shipments"):
                     shipment = data["shipments"][0]
                     eta_days_range, eta_date_range = self._get_eta_ranges(shipment)
+                    expected_delivery = self._get_expected_delivery(shipment)
 
                     existing_package_data = self.tracked_packages.get(tracking_id, {})
                     package_data = {
@@ -375,12 +366,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "destination": shipment.get("destination"),
                         "eta_days_range": eta_days_range,
                         "eta_date_range": eta_date_range,
+                        "expected_delivery": expected_delivery,
                         "carrier": shipment.get("detectedCarrier", {}).get("name"),
                         "days_in_transit": next(
                             (
-                                attr["val"]
+                                attr.get("val")
                                 for attr in shipment.get("attributes", [])
-                                if attr["l"] == "days_transit"
+                                if attr.get("l") == "days_transit"
                             ),
                             None,
                         ),
