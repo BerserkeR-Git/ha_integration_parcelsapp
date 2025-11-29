@@ -73,7 +73,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
 
         Priority:
         1. lastState.location, if present
-        2. last state in states[] that has a location field
+        2. latest state in states[] that has a location field
         3. 'undefined' if nothing is available
         """
         last_state = shipment.get("lastState") or {}
@@ -81,11 +81,16 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         if loc:
             return loc
 
-        # Fallback: iterate states in reverse to find last location
-        for state in reversed(shipment.get("states", [])):
+        # states appears to be ordered newest -> oldest in the API response.
+        # We walk in that order and remember the latest location we see.
+        latest_location = None
+        for state in shipment.get("states", []):
             loc2 = state.get("location")
             if loc2:
-                return loc2
+                latest_location = loc2
+
+        if latest_location:
+            return latest_location
 
         return "undefined"
 
