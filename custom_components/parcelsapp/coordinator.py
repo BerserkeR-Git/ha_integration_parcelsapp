@@ -174,6 +174,7 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 existing_package_data = self.tracked_packages.get(tracking_id, {})
 
                 if "uuid" in data:
+                    # UUID returned — tracking initiated
                     package_data = {
                         **existing_package_data,
                         "status": "pending",
@@ -181,11 +182,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "uuid_timestamp": datetime.now(),
                         "message": "Tracking initiated",
                         "last_updated": datetime.now().isoformat(),
+                        "status_changed_at": datetime.now().isoformat(),
                         "name": name or existing_package_data.get("name"),
                     }
                     self.tracked_packages[tracking_id] = package_data
 
                 elif "shipments" in data and data["shipments"]:
+                    # Shipment data returned directly
                     shipment = data["shipments"][0]
 
                     resolved_location = resolve_location(shipment)
@@ -211,9 +214,12 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         if attr.get("l") == "eta":
                             expected_delivery = attr.get("val")
 
+                    now_iso = datetime.now().isoformat()
+                    new_status = shipment.get("status", "unknown")
+
                     package_data = {
                         **existing_package_data,
-                        "status": shipment.get("status", "unknown"),
+                        "status": new_status,
                         "message": shipment.get("lastState", {}).get(
                             "status", "No status available"
                         ),
@@ -232,7 +238,8 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                         "eta_days_range": eta_days_range,
                         "eta_date_range": eta_date_range,
                         "expected_delivery": expected_delivery,
-                        "last_updated": datetime.now().isoformat(),
+                        "last_updated": now_iso,
+                        "status_changed_at": now_iso,
                         "name": name or existing_package_data.get("name"),
                         "tracking_id": tracking_id,
                     }
@@ -323,9 +330,17 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 expected_delivery = attr.get("val")
 
         package_data = self.tracked_packages.get(tracking_id, {})
+        old_status = package_data.get("status")
+        new_status = shipment.get("status", "unknown")
+        now_iso = datetime.now().isoformat()
+
+        status_changed_at = package_data.get("status_changed_at")
+        if old_status is None or new_status != old_status:
+            status_changed_at = now_iso
+
         package_data.update(
             {
-                "status": shipment.get("status", "unknown"),
+                "status": new_status,
                 "message": shipment.get("lastState", {}).get(
                     "status", "No status available"
                 ),
@@ -344,7 +359,8 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 "eta_days_range": eta_days_range,
                 "eta_date_range": eta_date_range,
                 "expected_delivery": expected_delivery,
-                "last_updated": datetime.now().isoformat(),
+                "last_updated": now_iso,
+                "status_changed_at": status_changed_at,
             }
         )
 
