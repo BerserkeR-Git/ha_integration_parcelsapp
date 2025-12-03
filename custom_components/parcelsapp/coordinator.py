@@ -42,7 +42,6 @@ def _parse_iso(dt_str: str) -> datetime | None:
     if not dt_str or not isinstance(dt_str, str):
         return None
     try:
-        # Handle trailing Z as UTC
         if dt_str.endswith("Z"):
             dt_str = dt_str.replace("Z", "+00:00")
         return datetime.fromisoformat(dt_str)
@@ -71,7 +70,6 @@ def resolve_location(shipment: dict) -> str | None:
 
         dt = _parse_iso(state.get("date"))
         if dt is None:
-            # If no valid date, we still consider it but only if we have nothing else
             if best_state is None:
                 best_state = state
             continue
@@ -83,12 +81,10 @@ def resolve_location(shipment: dict) -> str | None:
     if best_state:
         loc = best_state.get("location")
         if loc:
-            # Country code (e.g. "NL") → readable
             if len(loc) == 2 and loc.isalpha():
                 return COUNTRY_MAP.get(loc.upper(), loc)
             return loc
 
-    # No location in any state: fall back based on shipment status
     status = (shipment.get("status") or "").lower()
 
     if status in ("delivered", "out_for_delivery", "pickup", "ready_for_pickup"):
@@ -178,7 +174,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                 existing_package_data = self.tracked_packages.get(tracking_id, {})
 
                 if "uuid" in data:
-                    # UUID returned — tracking initiated
                     package_data = {
                         **existing_package_data,
                         "status": "pending",
@@ -191,7 +186,6 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
                     self.tracked_packages[tracking_id] = package_data
 
                 elif "shipments" in data and data["shipments"]:
-                    # Shipment data returned directly
                     shipment = data["shipments"][0]
 
                     resolved_location = resolve_location(shipment)
@@ -358,13 +352,13 @@ class ParcelsAppCoordinator(DataUpdateCoordinator):
         await self._save_tracked_packages()
 
     async def update_tracked_packages(self) -> None:
+        """Update all tracked packages (including delivered and archived)."""
         for tracking_id, package_data in self.tracked_packages.items():
-            if package_data.get("status") not in ["delivered", "archived"]:
-                await self.update_package(
-                    tracking_id,
-                    package_data.get("uuid"),
-                    package_data.get("uuid_timestamp"),
-                )
+            await self.update_package(
+                tracking_id,
+                package_data.get("uuid"),
+                package_data.get("uuid_timestamp"),
+            )
 
     async def _async_update_data(self):
         status_data = await self._fetch_parcels_app_status()
